@@ -35,6 +35,7 @@ from collections import defaultdict
 from aiohttp import web
 
 import site_content as sc
+from report import trap_metrics      # shared with report.py
 
 LINKS_PER_PAGE = 12          # outgoing maze links per trap page
 PARAGRAPHS_PER_PAGE = 4
@@ -53,6 +54,16 @@ def init_db(path):
                ts REAL, ip TEXT, user_agent TEXT, path TEXT,
                kind TEXT, depth INTEGER, method TEXT, referer TEXT)"""
     )
+    # Columns added later for trap timing. Added in place so an existing
+    # log file from an older version keeps working (old rows get NULL).
+    cols = {row[1] for row in db.execute("PRAGMA table_info(hits)")}
+    if "duration" not in cols:
+        # Seconds the trap page held the bot's connection.
+        db.execute("ALTER TABLE hits ADD COLUMN duration REAL")
+    if "completed" not in cols:
+        # 1 = bot received the whole page, 0 = bot hung up early,
+        # -1 = turned away with 503 because the trap was full.
+        db.execute("ALTER TABLE hits ADD COLUMN completed INTEGER")
     db.commit()
     return db
 
@@ -64,11 +75,22 @@ def log_hit(app, request, kind, depth=0):
         ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
     else:
         ip = request.remote or "?"
-    app["db"].execute(
-        "INSERT INTO hits VALUES (?,?,?,?,?,?,?,?)",
+    cur = app["db"].execute(
+        "INSERT INTO hits (ts, ip, user_agent, path, kind, depth, method, referer)"
+        " VALUES (?,?,?,?,?,?,?,?)",
         (time.time(), ip or "?", request.headers.get("User-Agent", ""),
          request.path_qs[:2000], kind, depth, request.method,
          request.headers.get("Referer", "")[:500]),
+    )
+    app["db"].commit()
+    return cur.lastrowid       # lets the trap fill in timing afterwards
+
+
+def log_trap_end(app, rowid, started, completed):
+    """Record how long a trap page held the bot, and whether it stayed."""
+    app["db"].execute(
+        "UPDATE hits SET duration = ?, completed = ? WHERE rowid = ?",
+        (round(time.monotonic() - started, 3), completed, rowid),
     )
     app["db"].commit()
 
@@ -316,29 +338,41 @@ async def trap(request):
         depth = int(request.query.get("d", "1"))
     except ValueError:
         depth = 1
-    log_hit(request.app, request, "trap", depth)
+    rowid = log_hit(request.app, request, "trap", depth)
+    started = time.monotonic()   # stopwatch for this one page
 
     sem = request.app["sem"]
     if sem.locked():
         # Too many bots in the trap at once: answer cheaply instead of
         # letting the honeypot overload our own server.
+        log_trap_end(request.app, rowid, started, -1)
         return web.Response(status=503, headers={"Retry-After": "120"})
 
+    completed = 0
     async with sem:
-        body = build_trap_page(request.path, depth).encode()
-        drip = request.app["drip"]
-        resp = web.StreamResponse(
-            headers={"Content-Type": "text/html; charset=utf-8"})
-        await resp.prepare(request)
-        if drip <= 0:
-            await resp.write(body)
-        else:
-            chunk = max(1, len(body) // 10)
-            for i in range(0, len(body), chunk):
-                await resp.write(body[i:i + chunk])
-                await asyncio.sleep(drip / 10)
-        await resp.write_eof()
-        return resp
+        try:
+            body = build_trap_page(request.path, depth).encode()
+            drip = request.app["drip"]
+            resp = web.StreamResponse(
+                headers={"Content-Type": "text/html; charset=utf-8"})
+            await resp.prepare(request)
+            if drip <= 0:
+                await resp.write(body)
+            else:
+                chunk = max(1, len(body) // 10)
+                for i in range(0, len(body), chunk):
+                    await resp.write(body[i:i + chunk])
+                    await asyncio.sleep(drip / 10)
+            await resp.write_eof()
+            completed = 1
+            return resp
+        except ConnectionResetError:
+            # The bot hung up before the page finished: it gave up waiting.
+            return resp
+        finally:
+            # Runs whether the page finished, the bot hung up, or the
+            # request was cancelled -- so every trap page gets a duration.
+            log_trap_end(request.app, rowid, started, completed)
 
 
 async def catch_all(request):
@@ -351,7 +385,8 @@ async def stats(request):
     key = request.app["stats_key"]
     if key and request.query.get("key") != key:
         return await catch_all(request)
-    rows = request.app["db"].execute(
+    db = request.app["db"]
+    rows = db.execute(
         """SELECT ip, user_agent,
                   SUM(kind='trap'), SUM(kind='probe'), MAX(depth),
                   SUM(kind='robots') > 0, SUM(kind='asset') > 0,
@@ -359,14 +394,26 @@ async def stats(request):
            FROM hits GROUP BY ip, user_agent
            ORDER BY 3 DESC, 4 DESC LIMIT 500"""
     ).fetchall()
-    clients = [{
-        "ip": r[0], "user_agent": r[1], "trap_pages": r[2], "probes": r[3],
-        "max_depth": r[4], "read_robots_txt": bool(r[5]),
-        "fetched_assets": bool(r[6]), "seconds_active": r[7],
-        # One-strike rule (McKenna 2016): entering a robots.txt-disallowed
-        # area makes a client "bad". Probing exploit paths marks a scanner.
-        "verdict": "BAD BOT" if r[2] else "SCANNER" if r[3] else "ok",
-    } for r in rows]
+    # Per-page trap timing, grouped by client, for the trapped-time numbers.
+    trap_rows = defaultdict(list)
+    for ip, ua, ts, dur, comp in db.execute(
+            "SELECT ip, user_agent, ts, duration, completed FROM hits "
+            "WHERE kind='trap'"):
+        trap_rows[(ip, ua)].append((ts, dur, comp))
+
+    clients = []
+    for r in rows:
+        c = {
+            "ip": r[0], "user_agent": r[1], "trap_pages": r[2], "probes": r[3],
+            "max_depth": r[4], "read_robots_txt": bool(r[5]),
+            "fetched_assets": bool(r[6]), "seconds_active": r[7],
+            # One-strike rule (McKenna 2016): entering a robots.txt-disallowed
+            # area makes a client "bad". Probing exploit paths marks a scanner.
+            "verdict": "BAD BOT" if r[2] else "SCANNER" if r[3] else "ok",
+        }
+        if r[2]:
+            c.update(trap_metrics(trap_rows[(r[0], r[1])]))
+        clients.append(c)
     return web.json_response({"clients": clients})
 
 
